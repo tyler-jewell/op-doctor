@@ -6,6 +6,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   title-lint:
     if: github.event_name == 'pull_request'
@@ -14,12 +17,37 @@ jobs:
     uses: tyler-jewell/shared-config/.github/workflows/secrets-scan.yml@v1
     permissions:
       contents: read
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  # Runner picker: prefers the self-hosted Mac Studio (when online, idle and the event is a trusted
+  # same-repo one), else the fallback label. Fork PRs never reach the Studio. See shared-config docs/RUNNERS.md.
+  pick:
+    uses: tyler-jewell/shared-config/.github/workflows/select-runner.yml@v1
+    permissions:
+      contents: read
+    secrets:
+      runner-status-token: ${{ secrets.RUNNER_STATUS_TOKEN }}
+  # macOS leg: runs only when the self-hosted Mac Studio was picked. Otherwise we fall back to Linux (test-linux).
+  test-macos:
+    needs: pick
+    if: needs.pick.outputs.selfhosted == 'true'
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Syntax check
+        run: |
+          for f in bin/op-doctor contrib/pre-commit-op-lint tests/run.sh tests/fixtures/op; do bash -n "$f"; done
+      - name: Tests
+        run: bash tests/run.sh
+      - name: Dogfood (offline lint of this repo)
+        run: bin/op-doctor lint
+  # Linux leg: always hosted, so Linux portability is always proven (never on the Studio).
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -46,7 +74,7 @@ jobs:
         run: '[ "$R" = success ] || [ "$R" = skipped ]'
   ci:
     if: always()
-    needs: [secrets-scan, test]
+    needs: [pick, secrets-scan, test-macos, test-linux]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
