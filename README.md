@@ -16,7 +16,7 @@ Requires bash 3.2+ (macOS or Linux), git, awk/sed/grep, [jq](https://jqlang.gith
 1Password CLI `op`.
 
 ```sh
-git clone https://github.com/OWNER/op-doctor ~/.local/share/op-doctor
+git clone https://github.com/tyler-jewell/op-doctor ~/.local/share/op-doctor
 ln -s ~/.local/share/op-doctor/bin/op-doctor ~/.local/bin/op-doctor
 
 cd your-repo

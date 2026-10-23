@@ -2,7 +2,7 @@
 #
 #   jobs:
 #     op-doctor:
-#       uses: OWNER/op-doctor/.github/workflows/op-doctor.yml@<tag-or-sha>
+#       uses: tyler-jewell/op-doctor/.github/workflows/op-doctor.yml@<tag-or-sha>
 #       secrets: inherit        # optional; only OP_SERVICE_ACCOUNT_TOKEN is read
 #
 # Offline job (always): scan + lint, no secrets, no network calls to 1Password.
