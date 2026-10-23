@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Fake `op` for tests. Implements only what op-doctor uses.
+# State lives in $FAKE_OP_DIR:
+#   vaults/<vault>/<item>.json   item JSON (fields[], files[])
+#   signed_out                   if present, every command fails like a signed-out CLI
+#   denied                       vault names (one per line) that deny access
+#   ratelimited                  if present, item/read fail with a rate-limit error
+# $FAKE_OP_ITEMGET_FAIL=<item>   `item get` for that item fails with a generic error
+# $FAKE_OP_LOG                   appended with one line per call (never values)
+D="${FAKE_OP_DIR:?}"
+log() { [ -n "${FAKE_OP_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_OP_LOG"; return 0; }
+err() { printf '[ERROR] 2026/01/01 00:00:00 %s\n' "$*" >&2; exit 1; }
+
+case "${1:-}" in
+  --version) echo "2.41.0"; exit 0 ;;
+esac
+if [ -e "$D/signed_out" ]; then
+  log "signed-out-call $*"
+  err "You are not currently signed in. Please run 'op signin' to sign in to your account."
+fi
+
+case "${1:-}" in
+  whoami) log whoami; echo "URL: example.1password.com"; exit 0 ;;
+  account) log account-list; echo "SHORTHAND"; exit 0 ;;
+esac
+[ -e "$D/ratelimited" ] && { log "ratelimited $*"; err "Too many requests: rate limit exceeded"; }
+
+check_vault() { # vault
+  [ -d "$D/vaults/$1" ] || err "\"$1\" isn't a vault in this account. Specify the vault with its ID or name."
+  if [ -f "$D/denied" ] && grep -Fxq "$1" "$D/denied"; then err "access denied: you do not have access to vault \"$1\""; fi
+}
+
+case "${1:-} ${2:-}" in
+  "item get")
+    item=$3; shift 3; vault=""
+    while [ $# -gt 0 ]; do case "$1" in --vault) vault=$2; shift ;; esac; shift; done
+    log "item-get $vault $item"
+    [ "${FAKE_OP_ITEMGET_FAIL:-}" = "$item" ] && err "unexpected internal failure"
+    check_vault "$vault"
+    f="$D/vaults/$vault/$item.json"
+    [ -f "$f" ] || err "\"$item\" isn't an item in the \"$vault\" vault. Specify the item with its UUID, name, or domain."
+    cat "$f"; exit 0 ;;
+  "read "*)
+    shift; nonl=0
+    while [ $# -gt 0 ]; do case "$1" in --no-newline|-n) nonl=1 ;; op://*) ref=$1 ;; esac; shift; done
+    log "read $ref"
+    r=${ref#op://}; r=${r%%\?*}
+    IFS=/ read -r vault item a b <<<"$r"
+    section=""; field=$a; [ -n "$b" ] && { section=$a; field=$b; }
+    check_vault "$vault"
+    f="$D/vaults/$vault/$item.json"
+    [ -f "$f" ] || err "could not read secret '$ref': \"$item\" isn't an item in the \"$vault\" vault."
+    val=$(jq -r --arg f "$field" --arg s "$section" '
+      [.fields[] | select(((.label // "") | ascii_downcase) == ($f | ascii_downcase))
+       | select($s == "" or ((.section.label // "") | ascii_downcase) == ($s | ascii_downcase))] | first | if . == null then "\u0000MISSING" else (.value // "") end' "$f")
+    case "$val" in *MISSING*) err "could not read secret '$ref': the item doesn't have a field '$field'" ;; esac
+    if [ "$nonl" = 1 ]; then printf '%s' "$val"; else printf '%s\n' "$val"; fi
+    exit 0 ;;
+esac
+log "unsupported $*"
+echo "fake op: unsupported: $*" >&2
+exit 2
