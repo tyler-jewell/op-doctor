@@ -9,6 +9,7 @@
 VERSION="0.1.0"
 export GIT_OPTIONAL_LOCKS=0 OP_DEBUG=false LC_ALL=C
 umask 077
+trap "exit 0" PIPE
 
 EX_OK=0 EX_PROBLEMS=2 EX_OPDOWN=3 EX_ROOT=4 EX_USAGE=64
 STATES="ok empty missing-item missing-field missing-vault denied unresolved-variable error"

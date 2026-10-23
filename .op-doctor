@@ -1,0 +1,4 @@
+# op-doctor config for this repo: files that contain deliberate example/malformed references.
+ignore = bin/op-doctor
+ignore = docs/*
+ignore = tests/*
