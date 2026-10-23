@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+# op-doctor: verify that every op:// secret reference in your repos is well-formed
+# and (optionally) resolves to a non-empty value in 1Password, without ever
+# printing a secret value. Read-only. Needs bash 3.2+, git, awk, sed, grep, jq,
+# and (for `check`) the 1Password CLI `op`.
+#
+# See `op-doctor --help`, README.md, AGENTS.md and docs/SCHEMA.md.
+
+VERSION="0.1.0"
+export GIT_OPTIONAL_LOCKS=0 OP_DEBUG=false LC_ALL=C
+umask 077
+
+EX_OK=0 EX_PROBLEMS=2 EX_OPDOWN=3 EX_ROOT=4 EX_USAGE=64
+STATES="ok empty missing-item missing-field missing-vault denied unresolved-variable error"
+
+die_usage() { printf 'op-doctor: %s\nTry: op-doctor --help\n' "$1" >&2; exit $EX_USAGE; }
+
+usage() {
+  cat <<'EOF'
+op-doctor - check that op:// references in your repos resolve to set values in 1Password.
+Never prints secret values. Read-only. No telemetry.
+
+USAGE
+  op-doctor <command> [options] [ROOT...]
+
+COMMANDS
+  scan     List every op:// reference in tracked files (offline).
+  lint     Static checks, offline, no `op` needed (malformed refs, tracked .env files,
+           plaintext secret-like values; --public adds hardcoded-vault warnings).
+  check    LIVE: resolve each distinct reference via `op` and report its state.
+  doctor   lint + check with one combined summary.
+  roots    Show which repositories would be examined.
+
+ROOTS (default: the git repository containing the current directory)
+  ROOT...            repository paths (positional)
+  --root PATH        add a repository (repeatable)
+  --roots FILE       file with one path per line (# comments)
+  --all              use $XDG_CONFIG_HOME/op-doctor/roots, else the dotfiles manifest
+                     $XDG_CONFIG_HOME/dotfiles/repos.txt, else ~/workspaces/*/ git repos
+  --exclude PATTERN  skip roots whose path matches the glob (repeatable)
+
+OPTIONS
+  --json             machine-readable output, schema op-doctor/v1 (docs/SCHEMA.md)
+  --quiet            print only problems (human output)
+  --no-color         disable colour (also honours NO_COLOR and non-TTY)
+  --public           lint: warn on hardcoded vault names (use op://$OP_VAULT/...)
+  --var NAME=VALUE   check: value for a variable used in references (non-secret names only)
+  --max-requests N   check: refuse to run if the plan exceeds N API requests (default 200)
+  --method M         check: auto (default; one `op item get` per item, `op read` fallback)
+                     or read (one `op read` per reference)
+  --dry-run          check: print the plan and estimated request count; call nothing
+  --version, --help
+
+CONFIG (optional) $XDG_CONFIG_HOME/op-doctor/config, lines "key = value":
+  exclude = GLOB (repeatable) | max_requests = N | public = true|false
+Per-repo (optional) .op-doctor: public = true|false | ignore = GLOB (file paths to skip)
+Per-line opt-out: put "op-doctor:ignore" on the line.
+
+EXIT CODES
+  0  all good            2  problems found (lint errors, empty/unresolved refs)
+  3  op unavailable (missing, signed out, locked, rate limited)
+  4  invalid config or root     64  usage error
+  Precedence when mixed: 64 > 4 > 3 > 2 > 0.
+
+ENVIRONMENT
+  OP_SERVICE_ACCOUNT_TOKEN, OP_CONNECT_HOST/OP_CONNECT_TOKEN are honoured by `op` itself.
+  Secrets are never accepted on the command line.
+EOF
+}
+
+# ---------------------------------------------------------------- arguments
+CMD="" JSON=0 QUIET=0 NOCOLOR=0 PUBLIC=0 DRY=0 MAXREQ=200 METHOD=auto ALL=0 ROOTS_FILE=""
+ROOT_ARGS=() EXCLUDES=() VARS=()
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+SEP=$(printf '\037')
+
+NORM=()
+for a in "$@"; do
+  case "$a" in
+    --*=*) NORM+=("${a%%=*}" "${a#*=}") ;;
+    *) NORM+=("$a") ;;
+  esac
+done
+set -- "${NORM[@]}"
+
+load_config() {
+  local f="$CONF_DIR/op-doctor/config" line k v n=0
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in ''|'#'*|[[:space:]]*'#'*) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    [ "$k" = "$line" ] && { CONF_ERR="$f:$n: expected 'key = value'"; return 1; }
+    k=$(printf '%s' "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    v=$(printf '%s' "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$k" in
+      exclude) EXCLUDES+=("$v") ;;
+      max_requests) case "$v" in ''|*[!0-9]*) CONF_ERR="$f:$n: max_requests must be an integer"; return 1 ;; esac; MAXREQ=$v ;;
+      public) case "$v" in true) PUBLIC=1 ;; false) PUBLIC=0 ;; *) CONF_ERR="$f:$n: public must be true or false"; return 1 ;; esac ;;
+      *) CONF_ERR="$f:$n: unknown key '$k'"; return 1 ;;
+    esac
+  done < "$f"
+  return 0
+}
+
+CONF_ERR=""
+load_config || { printf 'op-doctor: invalid config: %s\n' "$CONF_ERR" >&2; exit $EX_ROOT; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --version) printf 'op-doctor %s\n' "$VERSION"; exit 0 ;;
+    --json) JSON=1 ;;
+    --quiet|-q) QUIET=1 ;;
+    --no-color) NOCOLOR=1 ;;
+    --public) PUBLIC=1 ;;
+    --dry-run) DRY=1 ;;
+    --all) ALL=1 ;;
+    --root) [ $# -ge 2 ] || die_usage "--root needs a value"; ROOT_ARGS+=("$2"); shift ;;
+    --roots) [ $# -ge 2 ] || die_usage "--roots needs a value"; ROOTS_FILE=$2; shift ;;
+    --exclude) [ $# -ge 2 ] || die_usage "--exclude needs a value"; EXCLUDES+=("$2"); shift ;;
+    --var) [ $# -ge 2 ] || die_usage "--var needs NAME=VALUE"; VARS+=("$2"); shift ;;
+    --max-requests)
+      [ $# -ge 2 ] || die_usage "--max-requests needs a value"
+      case "$2" in ''|*[!0-9]*) die_usage "--max-requests must be a non-negative integer" ;; esac
+      MAXREQ=$2; shift ;;
+    --method)
+      [ $# -ge 2 ] || die_usage "--method needs a value"
+      case "$2" in auto|read) METHOD=$2 ;; *) die_usage "--method must be auto or read" ;; esac; shift ;;
+    --token|--password|--secret|--service-account-token)
+      die_usage "secrets are never accepted on the command line; use OP_SERVICE_ACCOUNT_TOKEN in the environment" ;;
+    -*) die_usage "unknown option: $1" ;;
+    *)
+      if [ -z "$CMD" ]; then CMD=$1; else ROOT_ARGS+=("$1"); fi ;;
+  esac
+  shift
+done
+
+[ -n "$CMD" ] || { usage >&2; exit $EX_USAGE; }
+case "$CMD" in scan|lint|check|doctor|roots) ;; help) usage; exit 0 ;; *) die_usage "unknown command: $CMD" ;; esac
+
+for v in ${VARS[@]+"${VARS[@]}"}; do
+  case "$v" in [A-Za-z_]*=*) ;; *) die_usage "--var expects NAME=VALUE" ;; esac
+done
+
+COLOR=0
+if [ "$JSON" = 0 ] && [ "$NOCOLOR" = 0 ] && [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then COLOR=1; fi
+paint() { # color text
+  if [ "$COLOR" = 1 ]; then
+    case "$1" in red) printf '\033[31m%s\033[0m' "$2" ;; green) printf '\033[32m%s\033[0m' "$2" ;; yellow) printf '\033[33m%s\033[0m' "$2" ;; *) printf '%s' "$2" ;; esac
+  else printf '%s' "$2"; fi
+}
+
+command -v git >/dev/null 2>&1 || { echo "op-doctor: git is required" >&2; exit $EX_USAGE; }
+command -v jq >/dev/null 2>&1 || { echo "op-doctor: jq is required (brew install jq / apt install jq)" >&2; exit $EX_USAGE; }
+
+W=$(mktemp -d "${TMPDIR:-/tmp}/op-doctor.XXXXXX") || exit $EX_USAGE
+trap 'rm -rf "$W"' EXIT
+: > "$W/roots.tsv"; : > "$W/refs.raw"; : > "$W/findings.tsv"; : > "$W/checks.tsv"; : > "$W/errors.tsv"; : > "$W/vars"
+
+# ---------------------------------------------------------------- awk programs
+cat > "$W/extract.awk" <<'EOF'
+# input: file \001 line \001 text   -> output: file line var ref
+BEGIN { FS = "\001"; OFS = "\t" }
+function emit(v, r) {
+  sub(/[.,;:]+$/, "", r)
+  if (substr(r, 6, 1) !~ /[A-Za-z0-9_$.{-]/) return
+  print file, ln, v, r
+}
+{
+  file = $1; ln = $2; text = $3
+  for (i = 4; i <= NF; i++) text = text FS $i
+  if (index(text, "op-doctor:ignore")) next
+  if (match(text, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*[=:][ \t]*["']?op:\/\//)) {
+    pre = substr(text, 1, RLENGTH - 5)
+    rest = substr(text, RLENGTH - 4)
+    v = pre
+    sub(/^[ \t]*(export[ \t]+)?/, "", v)
+    sub(/[ \t]*[=:][ \t]*["']?$/, "", v)
+    q = substr(pre, length(pre), 1)
+    if (q != "\"" && q != "'") q = ""
+    if (q != "") { e = index(rest, q); val = e ? substr(rest, 1, e - 1) : rest }
+    else { val = rest; sub(/[ \t#].*$/, "", val); sub(/["',]+$/, "", val) }
+    emit(v, val)
+    next
+  }
+  s = text
+  while ((p = index(s, "op://")) > 0) {
+    s2 = substr(s, p)
+    if (!match(s2, /^op:\/\/[^] \t"'`)}>,<\\]*/)) break
+    emit("", substr(s2, 1, RLENGTH))
+    s = substr(s2, RLENGTH + 1)
+  }
+}
+EOF
+
+cat > "$W/parse.awk" <<'EOF'
+# input: root file line var ref -> + parse parse_detail vault item section field query
+BEGIN { FS = OFS = "\t" }
+{
+  ref = $5; r = substr(ref, 6); q = ""
+  i = index(r, "?"); if (i) { q = substr(r, i + 1); r = substr(r, 1, i - 1) }
+  n = split(r, s, "/"); st = "ok"; d = ""
+  if (n < 3 || n > 4) { st = "malformed"; d = "expected op://vault/item/field or op://vault/item/section/field" }
+  else for (j = 1; j <= n; j++) {
+    t = s[j]
+    if (t == "") { st = "malformed"; d = "empty segment"; break }
+    if (substr(t, 1, 1) == "-") { st = "malformed"; d = "segment starts with '-'"; break }
+    u = t; gsub(/\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*/, "", u)
+    if (u ~ /[^A-Za-z0-9 _.-]/) { st = "malformed"; d = "unsupported character in segment " j " (use the ID instead of the name, or fix the variable syntax)"; break }
+  }
+  if (st == "ok" && q != "") {
+    m = split(q, kv, "&")
+    for (j = 1; j <= m; j++) {
+      k = kv[j]; sub(/=.*$/, "", k)
+      if (k != "attribute" && k != "attr" && k != "ssh-format") { st = "malformed"; d = "unknown query parameter '" k "'"; break }
+    }
+  }
+  if (st != "ok") { print $0, st, d, "", "", "", "", ""; next }
+  if (n == 3) { sec = ""; fld = s[3] } else { sec = s[3]; fld = s[4] }
+  print $0, st, "", s[1], s[2], sec, fld, q
+}
+EOF
+
+cat > "$W/lintenv.awk" <<'EOF'
+# input: env-style files -> file line key message (value is never printed)
+BEGIN { OFS = "\t" }
+function entropy(s,   i, c, n, e, p, seen) {
+  n = length(s); e = 0
+  delete seen
+  for (i = 1; i <= n; i++) seen[substr(s, i, 1)]++
+  for (c in seen) { p = seen[c] / n; e -= p * log(p) / log(2) }
+  return e
+}
+{
+  line = $0
+  if (index(line, "op-doctor:ignore")) next
+  if (line ~ /^[ \t]*(#|$)/) next
+  if (!match(line, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_.]*[ \t]*=/)) next
+  key = substr(line, 1, RLENGTH - 1)
+  sub(/^[ \t]*(export[ \t]+)?/, "", key); sub(/[ \t]+$/, "", key)
+  val = substr(line, RLENGTH + 1); sub(/^[ \t]+/, "", val)
+  if (val ~ /^"/) { sub(/^"/, "", val); e = index(val, "\""); if (e) val = substr(val, 1, e - 1) }
+  else if (val ~ /^'/) { sub(/^'/, "", val); e = index(val, "'"); if (e) val = substr(val, 1, e - 1) }
+  else { sub(/[ \t]+#.*$/, "", val); sub(/[ \t]+$/, "", val) }
+  if (val == "") next
+  if (val ~ /^op:\/\//) next
+  if (val ~ /\{\{[ ]*op:\/\//) next
+  if (val ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) next
+  lv = tolower(val)
+  if (lv == "true" || lv == "false" || lv == "yes" || lv == "no" || lv == "null" || lv == "none") next
+  if (val ~ /^[0-9]+$/ && length(val) <= 6) next
+  uk = toupper(key)
+  named = (uk ~ /(KEY|TOKEN|SECRET|PASSWORD|PASS|PRIVATE|CREDENTIAL)/) && (uk !~ /PUBLIC/)
+  if (named) { print FILENAME, FNR, key, "secret-like key name with a plaintext value (use an op:// reference)"; next }
+  if (length(val) >= 20 && val !~ /^https?:\/\/[^@]*$/ && val !~ /[ \/]/ && entropy(val) >= 3.5) {
+    print FILENAME, FNR, key, "high-entropy plaintext value (use an op:// reference)"
+  }
+}
+EOF
+
+cat > "$W/resolve.awk" <<'EOF'
+# args: varsfile refs.tsv(parsed). output: raw status detail vault item section field query
+BEGIN { FS = OFS = "\t" }
+function subst(s,   out, name, val, tok, bad) {
+  out = ""
+  while (match(s, /\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*/)) {
+    tok = substr(s, RSTART, RLENGTH)
+    name = tok; gsub(/[${}]/, "", name)
+    if (toupper(name) ~ /(KEY|TOKEN|SECRET|PASSWORD|PASS|PRIVATE|CREDENTIAL)/) { refused = refused (refused ? "," : "") name; val = "" }
+    else if (name in V) val = V[name]
+    else if (name in ENVIRON && ENVIRON[name] != "") val = ENVIRON[name]
+    else { unset = unset (unset ? "," : "") name; val = "" }
+    if (val != "" && val !~ /^[A-Za-z0-9 _.-]+$/ ) { badv = badv (badv ? "," : "") name; val = "" }
+    out = out substr(s, 1, RSTART - 1) val
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
+FILENAME == ARGV[1] { i = index($0, "="); if (i > 1) V[substr($0, 1, i - 1)] = substr($0, i + 1); next }
+{
+  raw = $5
+  if (seen[raw]++) next
+  if ($6 != "ok") { print raw, "malformed", $7, "", "", "", "", ""; next }
+  unset = refused = badv = ""
+  a = subst($8); b = subst($9); c = subst($10); d = subst($11)
+  if (unset != "" || refused != "" || badv != "") {
+    det = ""
+    if (unset != "") det = "unset: " unset
+    if (refused != "") det = det (det ? "; " : "") "refused secret-like variable name: " refused
+    if (badv != "") det = det (det ? "; " : "") "invalid value for: " badv
+    print raw, "unresolved", det, "", "", "", "", ""; next
+  }
+  print raw, "ok", "", a, b, c, d, $12
+}
+EOF
+
+# ---------------------------------------------------------------- roots
+resolve_roots() {
+  : > "$W/roots.in"
+  local p
+  for p in ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}; do printf '%s\tstrict\n' "$p" >> "$W/roots.in"; done
+  [ -n "$ROOTS_FILE" ] && read_list "$ROOTS_FILE" strict
+  if [ "$ALL" = 1 ]; then
+    if [ -f "$CONF_DIR/op-doctor/roots" ]; then read_list "$CONF_DIR/op-doctor/roots" strict
+    elif [ -f "$CONF_DIR/dotfiles/repos.txt" ]; then read_manifest "$CONF_DIR/dotfiles/repos.txt"
+    else
+      for p in "$HOME"/workspaces/*/; do [ -e "${p}.git" ] && printf '%s\tlenient\n' "${p%/}" >> "$W/roots.in"; done
+    fi
+  fi
+  if [ ! -s "$W/roots.in" ] && [ "$ALL" = 0 ] && [ -z "$ROOTS_FILE" ]; then
+    printf '.\tstrict\n' >> "$W/roots.in"
+  fi
+}
+read_list() { # file mode
+  local line
+  [ -r "$1" ] || { printf 'rootsfile\tcannot read roots file: %s\n' "$1" >> "$W/errors.tsv"; ROOT_ERR=1; return; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$line" in ''|'#'*) continue ;; esac
+    line=${line/#\~/$HOME}
+    printf '%s\t%s\n' "$line" "$2" >> "$W/roots.in"
+  done < "$1"
+}
+read_manifest() { # owner/repo dest role sync [exempt]
+  local owner dest rest
+  while read -r owner dest rest; do
+    case "$owner" in ''|'#'*) continue ;; esac
+    dest=${dest/#\~/$HOME}
+    [ -e "$dest/.git" ] && printf '%s\tlenient\n' "$dest" >> "$W/roots.in"
+  done < "$1"
+}
+
+ROOT_ERR=0
+is_excluded() { # path
+  local pat
+  for pat in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+    # shellcheck disable=SC2254
+    case "$1" in $pat) return 0 ;; esac
+    case "$(basename "$1")" in $pat) return 0 ;; esac
+  done
+  return 1
+}
+
+is_example() { case "$1" in *.example|*.sample|*.template|*.dist) return 0 ;; esac; return 1; }
+is_env_style() { # path
+  local b; b=$(basename "$1")
+  is_example "$b" && return 1
+  case "$1" in .op/*|*/.op/*) return 0 ;; esac
+  case "$b" in op.refs|*.op.env|.env.op|.env|.env.*|*.env) return 0 ;; esac
+  return 1
+}
+is_plain_env_file() { # tracked plaintext env file (error)
+  local b; b=$(basename "$1")
+  is_example "$b" && return 1
+  case "$b" in .env.op) return 1 ;; .env|.env.*) return 0 ;; esac
+  return 1
+}
+finding() { # root file line code severity key message
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$W/findings.tsv"
+}
+
+collect_root() { # path strict|lenient
+  local given=$1 mode=$2 top name seen_roots="$W/seen.roots" repo_public=0 ignores=() line k v n=0 f
+  if [ ! -d "$given" ]; then
+    [ "$mode" = lenient ] && return 0
+    printf '%s\t%s\terror\tnot a directory\n' "$given" "$(basename "$given")" >> "$W/roots.tsv"; ROOT_ERR=1; return 0
+  fi
+  if ! top=$(git -C "$given" rev-parse --show-toplevel 2>/dev/null); then
+    [ "$mode" = lenient ] && return 0
+    printf '%s\t%s\terror\tnot a git repository\n' "$given" "$(basename "$given")" >> "$W/roots.tsv"; ROOT_ERR=1; return 0
+  fi
+  name=$(basename "$top")
+  touch "$seen_roots"
+  grep -Fxq "$top" "$seen_roots" && return 0
+  printf '%s\n' "$top" >> "$seen_roots"
+  if is_excluded "$top"; then
+    printf '%s\t%s\texcluded\t\n' "$top" "$name" >> "$W/roots.tsv"; return 0
+  fi
+  if [ -f "$top/.op-doctor" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      n=$((n + 1))
+      case "$line" in ''|'#'*) continue ;; esac
+      k=$(printf '%s' "${line%%=*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      v=$(printf '%s' "${line#*=}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      case "$k=$v" in
+        public=true) repo_public=1 ;;
+        public=false) repo_public=0 ;;
+        ignore=?*) ignores+=("$v") ;;
+        *) printf '%s\t%s\terror\t.op-doctor line %s invalid\n' "$top" "$name" "$n" >> "$W/roots.tsv"; ROOT_ERR=1; return 0 ;;
+      esac
+    done < "$top/.op-doctor"
+  fi
+  printf '%s\t%s\tscanned\t\n' "$top" "$name" >> "$W/roots.tsv"
+
+  # files to skip
+  ignored() { local g; for g in ${ignores[@]+"${ignores[@]}"}; do
+      # shellcheck disable=SC2254
+      case "$1" in $g) return 0 ;; esac; done; return 1; }
+
+  # (1) env-style files, plaintext env files, ignored files
+  local envfiles=()
+  : > "$W/ign.list"
+  while IFS= read -r f; do
+    [ -f "$top/$f" ] && [ ! -L "$top/$f" ] || continue
+    if ignored "$f"; then printf '%s\n' "$f" >> "$W/ign.list"; continue; fi
+    if is_plain_env_file "$f"; then
+      finding "$top" "$f" "" L002 error "" "tracked plaintext env file; keep references in an op.refs file and run: op run --env-file=op.refs -- <cmd>"
+    fi
+    is_env_style "$f" && envfiles+=("$f")
+  done < <(git -C "$top" ls-files)
+  if [ ${#envfiles[@]} -gt 0 ]; then
+    ( cd "$top" && awk -f "$W/lintenv.awk" "${envfiles[@]}" ) | tr '\t' '\037' > "$W/le.tsv"
+    while IFS="$SEP" read -r f ln key msg; do
+      finding "$top" "$f" "$ln" L003 error "$key" "$msg"
+    done < "$W/le.tsv"
+  fi
+
+  # (2) references: tracked text files containing op://
+  ( cd "$top" && git grep -I -n -z -e 'op://' -- . 2>/dev/null ) | tr '\0' '\001' \
+    | awk -f "$W/extract.awk" \
+    | awk -F'\t' -v root="$top" 'FILENAME==ARGV[1]{ig[$0]=1;next} !($1 in ig){print root "\t" $0}' "$W/ign.list" - > "$W/ex2.tsv"
+  awk -f "$W/parse.awk" "$W/ex2.tsv" >> "$W/refs.raw"
+
+  # (3) reference-level lint
+  awk -F'\t' -v root="$top" -v pub="$((PUBLIC | repo_public))" '
+    $1 == root && $6 == "malformed" {
+      printf "%s\t%s\t%s\tL001\terror\t%s\tmalformed reference: %s\n", root, $2, $3, $4, $7; next }
+    pub == 1 && $1 == root && $6 == "ok" && $8 !~ /\$/ {
+      printf "%s\t%s\t%s\tL004\twarning\t%s\thardcoded vault name in a public repo; use op://$OP_VAULT/item/field and supply the vault at run time\n", root, $2, $3, $4 }
+  ' "$W/refs.raw" >> "$W/findings.tsv"
+}
+
+# ---------------------------------------------------------------- op helpers
+classify_err() { # stderr-file -> class
+  local t; t=$(tr 'A-Z' 'a-z' < "$1")
+  case "$t" in
+    *"rate limit"*|*"too many requests"*|*"ratelimit"*) echo ratelimited ;;
+    *"not currently signed in"*|*"op signin"*|*"desktop app"*|*"no accounts configured"*|*"session expired"*|*"locked"*|*"service account token"*|*"authentication required"*|*"not signed in"*) echo unavailable ;;
+    *"access denied"*|*"forbidden"*|*"do not have access"*|*"don't have access"*|*"not authorized"*|*"unauthorized"*|*"permission"*) echo denied ;;
+    *"isn't a vault"*|*"is not a vault"*|*"no vault"*|*"vault not found"*|*"could not find vault"*) echo missing-vault ;;
+    *"isn't an item"*|*"is not an item"*|*"no item"*|*"item not found"*|*"could not find item"*|*"couldn't find item"*) echo missing-item ;;
+    *"isn't a field"*|*"not a field"*|*"doesn't have a field"*|*"does not have a field"*|*"no field"*|*"field not found"*|*"could not find field"*|*"isn't a section"*) echo missing-field ;;
+    *) echo error ;;
+  esac
+}
+short_err() { head -n 1 "$1" | tr -d '\000-\010\013-\037' | cut -c1-160; }
+
+OP_DOWN=0 OP_HINT="" REQS_USED=0 PLAN_ITEMS=0 PLAN_REQS=0
+op_hint() { OP_HINT="1Password CLI is unavailable, signed out, locked, or rate limited. Locally: unlock/sign in to the 1Password app with CLI integration enabled. Headless or CI: export OP_SERVICE_ACCOUNT_TOKEN (read-only vault scope). Then retry."; }
+
+emit_group() { # group-json state detail
+  jq -r --arg s "$2" --arg d "$3" '.reqs[] | [.ref, $s, $d] | @tsv' <<<"$1" >> "$W/checks.tsv"
+}
+
+req_cost() { # vault item
+  if printf '%s' "$1" | grep -Eq '^[a-z0-9]{26}$' && printf '%s' "$2" | grep -Eq '^[a-z0-9]{26}$'; then echo 1; else echo 3; fi
+}
+read_one() { # rref cost -> sets R_STATE R_DETAIL
+  local bytes rc
+  REQS_USED=$((REQS_USED + $2))
+  op read --no-newline "$1" 2>"$W/op.err" | wc -c > "$W/bytes"
+  rc=${PIPESTATUS[0]}
+  bytes=$(tr -d ' \n' < "$W/bytes")
+  R_DETAIL=""
+  if [ "$rc" = 0 ]; then
+    if [ "${bytes:-0}" -gt 0 ]; then R_STATE=ok; else R_STATE=empty; fi
+    return
+  fi
+  R_STATE=$(classify_err "$W/op.err")
+  case "$R_STATE" in
+    unavailable|ratelimited) OP_DOWN=1; R_DETAIL=$R_STATE; R_STATE=error ;;
+    error) R_DETAIL=$(short_err "$W/op.err") ;;
+  esac
+}
+
+JQ_ITEM='
+def norm: ascii_downcase;
+. as $item
+| ($item.fields // []) as $fs | ($item.files // []) as $files
+| $reqs[] | . as $r
+| ([ $fs[]
+     | select(((.label // "") | norm) == ($r.field | norm) or ((.id // "") | norm) == ($r.field | norm))
+     | select($r.section == "" or ((.section.label // "") | norm) == ($r.section | norm) or ((.section.id // "") | norm) == ($r.section | norm)) ]) as $m
+| ([ $files[] | select(((.name // "") | norm) == ($r.field | norm)) ]) as $fm
+| (if ($m | length) > 0 then (if any($m[]; ((.value // "") | tostring | length) > 0) then "ok" else "empty" end)
+   elif ($fm | length) > 0 then (if any($fm[]; (.size // 1) > 0) then "ok" else "empty" end)
+   else "missing-field" end) as $st
+| [$r.ref, $st, ""] | @tsv'
+
+run_check() {
+  : > "$W/checks.tsv"
+  local v
+  for v in ${VARS[@]+"${VARS[@]}"}; do printf '%s\n' "$v" >> "$W/vars"; done
+  awk -f "$W/resolve.awk" "$W/vars" "$W/refs.raw" > "$W/resolved.tsv"
+  # unresolved / malformed straight to results
+  awk -F'\t' '$2=="unresolved"{print $1"\tunresolved-variable\t"$3} $2=="malformed"{print $1"\terror\tmalformed-reference: "$3}' "$W/resolved.tsv" >> "$W/checks.tsv"
+  jq -R -s '
+    split("\n") | map(select(length > 0) | split("\t")) | map(select(.[1] == "ok"))
+    | group_by([(.[3] | ascii_downcase), (.[4] | ascii_downcase)])
+    | map({vault: .[0][3], item: .[0][4],
+           reqs: map({ref: .[0], section: .[5], field: .[6],
+                      rref: ("op://" + .[3] + "/" + .[4] + "/" + (if .[5] != "" then .[5] + "/" else "" end) + .[6] + (if .[7] != "" then "?" + .[7] else "" end))})})' \
+    "$W/resolved.tsv" > "$W/groups.json"
+  local plan
+  plan=$(jq -c --arg m "$METHOD" '
+    def idl: test("^[a-z0-9]{26}$");
+    def cost: if (.vault | idl) and (.item | idl) then 1 else 3 end;
+    {items: length, requests: (map(if $m == "read" then ((.reqs | length) * cost) else cost end) | add // 0)}' "$W/groups.json")
+  PLAN_ITEMS=$(jq -r .items <<<"$plan"); PLAN_REQS=$(jq -r .requests <<<"$plan")
+  [ "$DRY" = 1 ] && return 0
+  if [ "$PLAN_REQS" -gt "$MAXREQ" ]; then
+    printf 'op-doctor: plan needs about %s API requests, above --max-requests %s. Narrow the roots, use item/vault IDs (1 request each), or raise the limit.\n' "$PLAN_REQS" "$MAXREQ" >&2
+    exit $EX_USAGE
+  fi
+  [ "$PLAN_ITEMS" -eq 0 ] && return 0
+  if ! command -v op >/dev/null 2>&1; then OP_DOWN=1; op_hint; OP_HINT="op (1Password CLI) not found on PATH. $OP_HINT"; mark_all_down; return 0; fi
+  if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] && [ -z "${OP_CONNECT_TOKEN:-}" ]; then
+    if ! op whoami >/dev/null 2>"$W/op.err"; then OP_DOWN=1; op_hint; mark_all_down; return 0; fi
+  fi
+  local n i g reqs gv gi st cls rc jqrc c ps
+  n=$(jq length "$W/groups.json"); : > "$W/badvaults"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    g=$(jq -c ".[$i]" "$W/groups.json"); i=$((i + 1))
+    if [ "$OP_DOWN" = 1 ]; then emit_group "$g" error "not-checked: op unavailable"; continue; fi
+    gv=$(jq -r .vault <<<"$g"); gi=$(jq -r .item <<<"$g")
+    # cached vault-level failure
+    c=$(awk -F'\t' -v v="$(printf '%s' "$gv" | tr 'A-Z' 'a-z')" '$1==v{print $2; exit}' "$W/badvaults")
+    if [ -n "$c" ]; then emit_group "$g" "$c" "vault-level (cached, no extra request)"; continue; fi
+    if [ "$METHOD" = read ]; then
+      read_group "$g"; continue
+    fi
+    c=$(req_cost "$gv" "$gi")
+    if [ $((REQS_USED + c)) -gt "$MAXREQ" ]; then emit_group "$g" error "max-requests-reached"; continue; fi
+    REQS_USED=$((REQS_USED + c))
+    reqs=$(jq -c .reqs <<<"$g")
+    op item get "$gi" --vault "$gv" --format json 2>"$W/op.err" | jq -r --argjson reqs "$reqs" "$JQ_ITEM" > "$W/out.tsv" 2>/dev/null
+    ps=("${PIPESTATUS[@]}"); rc=${ps[0]}; jqrc=${ps[1]}
+    if [ "$rc" = 0 ] && [ "$jqrc" = 0 ]; then
+      awk -F'\t' '{print $1"\t"$2"\t"$3}' "$W/out.tsv" >> "$W/checks.tsv"; continue
+    fi
+    if [ "$rc" = 0 ]; then emit_group "$g" error "unparseable response from op"; continue; fi
+    cls=$(classify_err "$W/op.err")
+    case "$cls" in
+      unavailable|ratelimited) OP_DOWN=1; op_hint; emit_group "$g" error "op-$cls" ;;
+      missing-vault|denied) printf '%s\t%s\n' "$(printf '%s' "$gv" | tr 'A-Z' 'a-z')" "$cls" >> "$W/badvaults"; emit_group "$g" "$cls" "" ;;
+      missing-item) emit_group "$g" missing-item "" ;;
+      *) # unknown error: fall back to op read per reference
+        read_group "$g" ;;
+    esac
+  done
+}
+read_group() { # group-json
+  local g=$1 k m j ref cst
+  cst=$(req_cost "$(jq -r .vault <<<"$g")" "$(jq -r .item <<<"$g")")
+  m=$(jq '.reqs | length' <<<"$g"); j=0
+  while [ "$j" -lt "$m" ]; do
+    ref=$(jq -r ".reqs[$j].ref" <<<"$g"); k=$(jq -r ".reqs[$j].rref" <<<"$g"); j=$((j + 1))
+    if [ "$OP_DOWN" = 1 ]; then printf '%s\terror\tnot-checked: op unavailable\n' "$ref" >> "$W/checks.tsv"; continue; fi
+    if [ $((REQS_USED + cst)) -gt "$MAXREQ" ]; then printf '%s\terror\tmax-requests-reached\n' "$ref" >> "$W/checks.tsv"; continue; fi
+    read_one "$k" "$cst"
+    [ "$OP_DOWN" = 1 ] && op_hint
+    printf '%s\t%s\t%s\n' "$ref" "$R_STATE" "$R_DETAIL" >> "$W/checks.tsv"
+  done
+}
+mark_all_down() {
+  local n i g; n=$(jq length "$W/groups.json"); i=0
+  while [ "$i" -lt "$n" ]; do g=$(jq -c ".[$i]" "$W/groups.json"); i=$((i + 1)); emit_group "$g" error "not-checked: op unavailable"; done
+}
+
+# ---------------------------------------------------------------- main
+resolve_roots
+[ "$CMD" = roots ] || true
+while IFS="$(printf '\t')" read -r p mode; do
+  collect_root "$p" "$mode"
+done < "$W/roots.in"
+if [ "$(awk -F'\t' '$3=="scanned"' "$W/roots.tsv" | wc -l | tr -d ' ')" = 0 ] && [ "$ROOT_ERR" = 0 ] \
+   && [ "$(awk -F'\t' '$3=="excluded"' "$W/roots.tsv" | wc -l | tr -d ' ')" = 0 ]; then
+  printf 'roots\tno repositories to examine\n' >> "$W/errors.tsv"; ROOT_ERR=1
+fi
+
+# distinct sorted refs inventory
+sort -t "$(printf '\t')" -k1,1 -k2,2 -k3,3n "$W/refs.raw" > "$W/refs.tsv"
+sort -t "$(printf '\t')" -k1,1 -k2,2 -k3,3n -k4,4 "$W/findings.tsv" > "$W/findings.sorted"
+
+case "$CMD" in check|doctor) run_check ;; esac
+
+LINT_ERRORS=$(awk -F'\t' '$5=="error"' "$W/findings.sorted" | wc -l | tr -d ' ')
+LINT_WARNS=$(awk -F'\t' '$5=="warning"' "$W/findings.sorted" | wc -l | tr -d ' ')
+CHECK_BAD=$(awk -F'\t' '$2!="ok"' "$W/checks.tsv" | wc -l | tr -d ' ')
+
+PROBLEMS=0
+case "$CMD" in
+  lint) [ "$LINT_ERRORS" -gt 0 ] && PROBLEMS=1 ;;
+  check) [ "$CHECK_BAD" -gt 0 ] && PROBLEMS=1 ;;
+  doctor) { [ "$LINT_ERRORS" -gt 0 ] || [ "$CHECK_BAD" -gt 0 ]; } && PROBLEMS=1 ;;
+esac
+EXIT=0
+[ "$DRY" = 1 ] && PROBLEMS=0
+[ "$PROBLEMS" = 1 ] && EXIT=$EX_PROBLEMS
+[ "$OP_DOWN" = 1 ] && EXIT=$EX_OPDOWN
+[ "$ROOT_ERR" = 1 ] && EXIT=$EX_ROOT
+[ "$OP_DOWN" = 1 ] && [ -n "$OP_HINT" ] && printf 'op-unavailable\t%s\n' "$OP_HINT" >> "$W/errors.tsv"
+awk -F'\t' '$3=="error"{print "root\t"$1": "$4}' "$W/roots.tsv" >> "$W/errors.tsv"
+
+# ---------------------------------------------------------------- output
+emit_json() {
+  jq -n \
+    --arg version "$VERSION" --arg command "$CMD" --arg code "$EXIT" --arg dry "$DRY" \
+    --arg maxreq "$MAXREQ" --arg planitems "$PLAN_ITEMS" --arg planreqs "$PLAN_REQS" --arg used "$REQS_USED" \
+    --rawfile roots "$W/roots.tsv" --rawfile refs "$W/refs.tsv" --rawfile finds "$W/findings.sorted" \
+    --rawfile checks "$W/checks.tsv" --rawfile errs "$W/errors.tsv" --arg states "$STATES" '
+    def rows(s): (s | split("\n") | map(select(length > 0) | split("\t")));
+    def n: if . == "" then null else . end;
+    rows($roots) as $R | rows($refs) as $F | rows($finds) as $L | rows($checks) as $C | rows($errs) as $E
+    | ($states | split(" ")) as $S
+    | {
+      schema: "op-doctor/v1", version: $version, command: $command, exit_code: ($code | tonumber),
+      dry_run: ($dry == "1"),
+      roots: [$R[] | {path: .[0], name: .[1], status: .[2], detail: (.[3] | n)}],
+      references: [$F[] | {root: .[0], file: .[1], line: (.[2] | tonumber), variable: (.[3] | n), ref: .[4],
+                           parse: .[5], parse_detail: (.[6] | n), vault: (.[7] | n), item: (.[8] | n),
+                           section: (.[9] | n), field: (.[10] | n), query: (.[11] | n)}],
+      findings: [$L[] | {root: .[0], file: .[1], line: (.[2] | n | if . == null then null else tonumber end), code: .[3],
+                         severity: .[4], key: (.[5] | n), message: .[6]}],
+      checks: [$C | sort_by(.[0])[] | . as $c | {ref: $c[0], state: $c[1], detail: ($c[2] | n),
+                locations: [$F[] | select(.[4] == $c[0]) | {root: .[0], file: .[1], line: (.[2] | tonumber), variable: (.[3] | n)}]}],
+      plan: (if ($command == "check" or $command == "doctor") then {items: ($planitems | tonumber), requests_estimated: ($planreqs | tonumber), max_requests: ($maxreq | tonumber)} else null end),
+      errors: [$E[] | {code: .[0], message: .[1]}],
+      summary: {
+        roots: ($R | map(select(.[2] == "scanned")) | length),
+        references: ($F | length),
+        distinct_references: ($F | map(.[4]) | unique | length),
+        lint_errors: ($L | map(select(.[4] == "error")) | length),
+        lint_warnings: ($L | map(select(.[4] == "warning")) | length),
+        states: (reduce $S[] as $s ({}; .[$s] = 0) | reduce ($C[] | .[1]) as $s (.; .[$s] += 1)),
+        requests_used: ($used | tonumber)
+      }
+    }'
+}
+
+emit_human() {
+  case "$CMD" in
+    roots)
+      tr '\t' '\037' < "$W/roots.tsv" | while IFS="$SEP" read -r p nm st d; do printf '%-9s %s%s\n' "$st" "$p" "${d:+  ($d)}"; done ;;
+    scan)
+      if [ "$QUIET" = 0 ]; then
+        awk -F'\t' '{ nm=$1; sub(/.*\//,"",nm); v=($4==""?"-":$4);
+          if ($6=="ok") d=$8"/"$9"/"($10!=""?$10"/":"")$11; else d="(malformed: "$7")";
+          printf "%s  %s:%s  %s  %s\n", nm, $2, $3, v, d }' "$W/refs.tsv"
+      fi ;;
+  esac
+  case "$CMD" in lint|doctor)
+    tr '\t' '\037' < "$W/findings.sorted" | while IFS="$SEP" read -r root file line code sev key msg; do
+      [ "$QUIET" = 1 ] && [ "$sev" = warning ] && continue
+      local nm; nm=$(basename "$root")
+      if [ "$sev" = error ]; then paint red "error  "; else paint yellow "warning"; fi
+      printf ' %s/%s%s  %s%s  %s\n' "$nm" "$file" "${line:+:$line}" "$code" "${key:+ [$key]}" "$msg"
+    done ;;
+  esac
+  case "$CMD" in check|doctor)
+    if [ "$DRY" = 1 ]; then
+      printf 'plan: %s item(s), about %s API request(s) (limit %s); nothing was called\n' "$PLAN_ITEMS" "$PLAN_REQS" "$MAXREQ"
+    else
+      sort "$W/checks.tsv" | tr '\t' '\037' | while IFS="$SEP" read -r ref st det; do
+        [ "$QUIET" = 1 ] && [ "$st" = ok ] && continue
+        if [ "$st" = ok ]; then paint green "$st"; else paint red "$st"; fi
+        printf '%*s' $((22 - ${#st})) ""
+        printf '%s%s\n' "$ref" "${det:+  ($det)}"
+      done
+    fi ;;
+  esac
+  [ -s "$W/errors.tsv" ] && tr '\t' '\037' < "$W/errors.tsv" | while IFS="$SEP" read -r c m; do printf 'op-doctor: %s\n' "$m" >&2; done
+  # summary line
+  local r d ck
+  r=$(awk -F'\t' '$3=="scanned"' "$W/roots.tsv" | wc -l | tr -d ' ')
+  d=$(cut -f5 "$W/refs.tsv" | sort -u | wc -l | tr -d ' ')
+  ck=$(awk -F'\t' '$2=="ok"' "$W/checks.tsv" | wc -l | tr -d ' ')
+  if [ "$QUIET" = 0 ] || [ "$EXIT" != 0 ]; then
+    case "$CMD" in
+      roots) printf '%s root(s)\n' "$r" ;;
+      scan) printf 'summary: %s reference(s), %s distinct, %s repo(s)\n' "$(wc -l < "$W/refs.tsv" | tr -d ' ')" "$d" "$r" ;;
+      lint) printf 'summary: %s error(s), %s warning(s), %s repo(s)\n' "$LINT_ERRORS" "$LINT_WARNS" "$r" ;;
+      check) [ "$DRY" = 1 ] || printf 'summary: %s of %s distinct reference(s) ok, %s request(s) used\n' "$ck" "$(wc -l < "$W/checks.tsv" | tr -d ' ')" "$REQS_USED" ;;
+      doctor) [ "$DRY" = 1 ] || printf 'summary: lint %s error(s) %s warning(s); check %s of %s ok; %s request(s); exit %s\n' "$LINT_ERRORS" "$LINT_WARNS" "$ck" "$(wc -l < "$W/checks.tsv" | tr -d ' ')" "$REQS_USED" "$EXIT" ;;
+    esac
+  fi
+}
+
+if [ "$JSON" = 1 ]; then emit_json; else emit_human; fi
+exit "$EXIT"
