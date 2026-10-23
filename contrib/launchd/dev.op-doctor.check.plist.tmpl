@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for a DAILY live healthcheck across all roots. NOT installed by default.
+     Replace @HOME@ and @OP_DOCTOR@ (absolute path to bin/op-doctor), then copy to
+     ~/Library/LaunchAgents/dev.op-doctor.check.plist and: launchctl load <that file>
+     See contrib/launchd/run-check.sh for what it runs (JSON report in ~/Library/Logs/op-doctor/).
+     Live checks consume service-account quota (1Password personal plan: 1,000 requests/day):
+     keep this at once a day at most. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.op-doctor.check</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>@OP_DOCTOR_DIR@/contrib/launchd/run-check.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>15</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>@HOME@</string>
+    <!-- Provide the service account token to the job WITHOUT putting it in this file:
+         have run-check.sh read it from your keychain or a 0600 file (see the script). -->
+  </dict>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/op-doctor/launchd.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/op-doctor/launchd.log</string>
+</dict>
+</plist>

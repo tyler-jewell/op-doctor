@@ -1,0 +1,93 @@
+# Reusable workflow. Call it from another repository:
+#
+#   jobs:
+#     op-doctor:
+#       uses: OWNER/op-doctor/.github/workflows/op-doctor.yml@<tag-or-sha>
+#       secrets: inherit        # optional; only OP_SERVICE_ACCOUNT_TOKEN is read
+#
+# Offline job (always): scan + lint, no secrets, no network calls to 1Password.
+# Live job (optional): runs `check` only when the OP_SERVICE_ACCOUNT_TOKEN secret is present.
+# Use a read-only service account scoped to the vaults you reference. Live checks consume
+# service-account request quota: run them on a schedule or on main, not on every push.
+name: op-doctor
+on:
+  workflow_call:
+    inputs:
+      tool_repository:
+        description: Repository that holds op-doctor (owner/name)
+        type: string
+        default: tyler-jewell/op-doctor
+      tool_ref:
+        description: Tag, branch or SHA of op-doctor to run (pin a tag or SHA in production)
+        type: string
+        default: main
+      public:
+        description: Treat the caller repo as public (adds hardcoded-vault warnings)
+        type: boolean
+        default: false
+      live:
+        description: Run the live check job when the token secret exists
+        type: boolean
+        default: true
+      max_requests:
+        description: Request budget for the live check
+        type: number
+        default: 100
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: false
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.tool_repository }}
+          ref: ${{ inputs.tool_ref }}
+          path: .op-doctor-tool
+          persist-credentials: false
+      - name: Scan
+        run: .op-doctor-tool/bin/op-doctor scan --no-color
+      - name: Lint
+        env:
+          PUBLIC: ${{ inputs.public }}
+        run: |
+          flags=""; [ "$PUBLIC" = "true" ] && flags="--public"
+          .op-doctor-tool/bin/op-doctor lint --no-color $flags
+  live:
+    if: ${{ inputs.live }}
+    needs: [offline]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - name: Token present?
+        id: tok
+        run: |
+          if [ -n "$OP_SERVICE_ACCOUNT_TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; echo "No OP_SERVICE_ACCOUNT_TOKEN secret; skipping live check."; fi
+      - if: steps.tok.outputs.present == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - if: steps.tok.outputs.present == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.tool_repository }}
+          ref: ${{ inputs.tool_ref }}
+          path: .op-doctor-tool
+          persist-credentials: false
+      - if: steps.tok.outputs.present == 'true'
+        uses: 1password/install-cli-action@707af61a6c8b4fa7f9476328c035208fba6b54d7 # v2.0.0
+      - if: steps.tok.outputs.present == 'true'
+        env:
+          MAX: ${{ inputs.max_requests }}
+        run: .op-doctor-tool/bin/op-doctor check --no-color --max-requests "$MAX"

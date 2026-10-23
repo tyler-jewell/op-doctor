@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Optional pre-commit hook: static, offline op-doctor lint (no `op`, no network, fast).
+# Install (off by default):
+#   ln -s /path/to/op-doctor/contrib/pre-commit-op-lint .git/hooks/pre-commit
+# Exit status is op-doctor's: 0 clean, 2 lint errors (commit blocked).
+here="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")" && pwd)"
+if command -v op-doctor >/dev/null 2>&1; then bin=op-doctor; else bin="$here/../bin/op-doctor"; fi
+exec "$bin" lint --quiet --no-color
